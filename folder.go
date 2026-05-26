@@ -10,14 +10,50 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 type entry struct {
-	name  string
-	isDir bool
-	path  string
+	name    string
+	isDir   bool
+	path    string
+	modTime time.Time
+}
+
+type folderSortMode int
+
+const (
+	folderSortAlpha folderSortMode = iota
+	folderSortModified
+)
+
+func (m folderSortMode) label() string {
+	switch m {
+	case folderSortModified:
+		return "date-modified"
+	default:
+		return "alphabetical"
+	}
+}
+
+func folderSortModeFromConfig(v string) folderSortMode {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "date-modified", "modified", "modtime":
+		return folderSortModified
+	default:
+		return folderSortAlpha
+	}
+}
+
+func (m folderSortMode) configValue() string {
+	switch m {
+	case folderSortModified:
+		return "date-modified"
+	default:
+		return "alphabetical"
+	}
 }
 
 type folderModel struct {
@@ -26,11 +62,15 @@ type folderModel struct {
 	entries       []entry
 	cursor        int
 	filter        string
+	filterCursor  int
 	filterMode    bool
 	helpMode      bool
+	helpScroll    int
 	selected      map[string]bool
 	history       map[string]int
 	filterHistory map[string]string
+	sortMode      folderSortMode
+	cfg           appConfig
 	status        string
 	isErr         bool
 	height        int
@@ -69,20 +109,99 @@ func (m *folderModel) artRefreshCmd() tea.Cmd {
 	switch artMode {
 	case 1:
 		key, cmd := artChafaForDir(dir)
-		if key == m.artPath || cmd == nil {
+		if key != m.artPath && isTransientMosaicStatus(m.status, m.isErr) {
+			m.status = ""
+			m.isErr = false
+		}
+		if key == m.artPath {
 			return nil
 		}
 		m.artPath = key
+		if cmd == nil {
+			return nil
+		}
 		return cmd
 	case 2:
 		key, cmd := openArtViewerForDir(dir)
-		if key == m.artPath || cmd == nil {
+		if key != m.artPath && isTransientMosaicStatus(m.status, m.isErr) {
+			m.status = ""
+			m.isErr = false
+		}
+		if key == m.artPath {
 			return nil
 		}
 		m.artPath = key
+		if cmd == nil {
+			return nil
+		}
 		return cmd
 	}
 	return nil
+}
+
+func clampInt(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func runeCount(s string) int {
+	return len([]rune(s))
+}
+
+func filterPromptText(filter string, cursor int, active bool) string {
+	runes := []rune(filter)
+	cursor = clampInt(cursor, 0, len(runes))
+	var sb strings.Builder
+	sb.WriteString("> ")
+	sb.WriteString(string(runes[:cursor]))
+	if active {
+		sb.WriteString("▌")
+	}
+	sb.WriteString(string(runes[cursor:]))
+	return sb.String()
+}
+
+func renderScrollableHelp(title string, lines []string, w, h, scroll int) string {
+	if w < 10 {
+		w = 80
+	}
+	if h < 6 {
+		h = 6
+	}
+	bodyHeight := h - 4
+	if bodyHeight < 1 {
+		bodyHeight = 1
+	}
+	maxScroll := 0
+	if len(lines) > bodyHeight {
+		maxScroll = len(lines) - bodyHeight
+	}
+	scroll = clampInt(scroll, 0, maxScroll)
+	end := scroll + bodyHeight
+	if end > len(lines) {
+		end = len(lines)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(stylePath.Render("  "+title) + "\n")
+	sb.WriteString(styleDim.Render(strings.Repeat("─", w)) + "\n")
+	for _, l := range lines[scroll:end] {
+		sb.WriteString(styleHelp.Render(l) + "\n")
+	}
+	for i := end - scroll; i < bodyHeight; i++ {
+		sb.WriteString("\n")
+	}
+	footer := fmt.Sprintf("  help %d-%d/%d  ↑↓ scroll  Home/End top/bottom  Esc close", scroll+1, end, len(lines))
+	if len(lines) == 0 {
+		footer = "  help 0/0  Esc close"
+	}
+	sb.WriteString(styleStatus.Render(footer))
+	return sb.String()
 }
 
 func (m *folderModel) applyFilter() {
@@ -106,11 +225,40 @@ func (m *folderModel) applyFilter() {
 func (m *folderModel) navigate(dest string) tea.Cmd {
 	m.history[m.dir] = m.cursor
 	m.filterHistory[m.dir] = m.filter
-	return navigateCmd(dest)
+	return navigateCmd(dest, m.sortMode)
 }
 
-func initialFolderModel(root string) folderModel {
-	entries, err := readDir(root)
+func (m *folderModel) toggleSortMode() tea.Cmd {
+	if m.sortMode == folderSortAlpha {
+		m.sortMode = folderSortModified
+	} else {
+		m.sortMode = folderSortAlpha
+	}
+	entries, err := readDir(m.dir, m.sortMode)
+	if err != nil {
+		m.status = "Error: " + err.Error()
+		m.isErr = true
+		return nil
+	}
+	m.allEntries = entries
+	m.applyFilter()
+	if m.cursor >= len(m.entries) {
+		m.cursor = 0
+	}
+	m.cfg.FolderSort = m.sortMode.configValue()
+	if err := saveConfig(m.cfg); err != nil {
+		m.status = "Error saving config: " + err.Error()
+		m.isErr = true
+		return m.artRefreshCmd()
+	}
+	m.status = "Sorting folders by " + m.sortMode.label()
+	m.isErr = false
+	return m.artRefreshCmd()
+}
+
+func initialFolderModel(root string, cfg appConfig) folderModel {
+	sortMode := folderSortModeFromConfig(cfg.FolderSort)
+	entries, err := readDir(root, sortMode)
 	m := folderModel{
 		dir:           root,
 		allEntries:    entries,
@@ -118,6 +266,8 @@ func initialFolderModel(root string) folderModel {
 		selected:      make(map[string]bool),
 		history:       make(map[string]int),
 		filterHistory: make(map[string]string),
+		sortMode:      sortMode,
+		cfg:           cfg,
 		height:        24,
 	}
 	if err != nil {
@@ -159,6 +309,9 @@ func (m folderModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.artRefreshCmd()
 
 	case statusMsg:
+		if msg.path != "" && msg.path != m.artPath {
+			return m, nil
+		}
 		m.status = msg.text
 		m.isErr = msg.isErr
 		return m, nil
@@ -173,12 +326,25 @@ func (m folderModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Any key closes help overlay
 		if m.helpMode {
 			switch k {
+			case "up", "k", "pgup", "pageup":
+				m.helpScroll--
+				return m, nil
+			case "down", "j", "pgdown", "pagedown":
+				m.helpScroll++
+				return m, nil
+			case "home", "g":
+				m.helpScroll = 0
+				return m, nil
+			case "end", "G":
+				m.helpScroll = 1 << 30
+				return m, nil
 			case "o":
 				return m, openConfigCmd(false)
 			case "O":
 				return m, openConfigCmd(true)
 			case "esc", "?", "q", "enter", " ":
 				m.helpMode = false
+				m.helpScroll = 0
 				return m, nil
 			}
 			return m, nil
@@ -188,6 +354,7 @@ func (m folderModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.filterMode {
 				m.filterMode = false
 				m.filter = ""
+				m.filterCursor = 0
 				m.applyFilter()
 				m.cursor = 0
 			} else if len(m.selected) > 0 {
@@ -198,6 +365,8 @@ func (m folderModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.filterMode {
+			runes := []rune(m.filter)
+			m.filterCursor = clampInt(m.filterCursor, 0, len(runes))
 			switch k {
 			case "up":
 				if m.cursor > 0 {
@@ -209,7 +378,23 @@ func (m folderModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cursor++
 				}
 				return m, m.artRefreshCmd()
-			case "enter", "right":
+			case "left":
+				if m.filterCursor > 0 {
+					m.filterCursor--
+				}
+				return m, m.artRefreshCmd()
+			case "right":
+				if m.filterCursor < len(runes) {
+					m.filterCursor++
+				}
+				return m, m.artRefreshCmd()
+			case "home":
+				m.filterCursor = 0
+				return m, m.artRefreshCmd()
+			case "end":
+				m.filterCursor = len(runes)
+				return m, m.artRefreshCmd()
+			case "enter":
 				if len(m.entries) == 0 {
 					return m, nil
 				}
@@ -227,25 +412,38 @@ func (m folderModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, playCmd(e.path, false)
 			case " ":
-				m.filter += " "
+				m.filter = string(runes[:m.filterCursor]) + " " + string(runes[m.filterCursor:])
+				m.filterCursor++
 				m.applyFilter()
 				m.cursor = 0
-				return m, nil
+				return m, m.artRefreshCmd()
 			case "backspace":
-				if m.filter != "" {
-					runes := []rune(m.filter)
-					m.filter = string(runes[:len(runes)-1])
+				if m.filterCursor > 0 {
+					m.filter = string(runes[:m.filterCursor-1]) + string(runes[m.filterCursor:])
+					m.filterCursor--
 					m.applyFilter()
+					m.cursor = 0
+					return m, m.artRefreshCmd()
 				} else {
 					m.filterMode = false
+				}
+				return m, nil
+			case "delete":
+				if m.filterCursor < len(runes) {
+					m.filter = string(runes[:m.filterCursor]) + string(runes[m.filterCursor+1:])
+					m.applyFilter()
+					m.cursor = 0
+					return m, m.artRefreshCmd()
 				}
 				return m, nil
 			default:
 				runes := []rune(k)
 				if len(runes) == 1 && runes[0] >= 32 {
-					m.filter += k
+					m.filter = string([]rune(m.filter)[:m.filterCursor]) + k + string([]rune(m.filter)[m.filterCursor:])
+					m.filterCursor += len(runes)
 					m.applyFilter()
 					m.cursor = 0
+					return m, m.artRefreshCmd()
 				}
 				return m, nil
 			}
@@ -357,7 +555,11 @@ func (m folderModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "?":
 			m.helpMode = true
+			m.helpScroll = 0
 			return m, nil
+
+		case "s":
+			return m, m.toggleSortMode()
 
 		case "p":
 			return m, pauseCmd()
@@ -422,15 +624,13 @@ func (m folderModel) View() string {
 	if m.helpMode {
 		cfgFile := configPath()
 		cfgDir := filepath.Dir(cfgFile)
-
-		sb.WriteString(stylePath.Render("  Folder Browser — Key Bindings") + "\n")
-		sb.WriteString(styleDim.Render(strings.Repeat("─", w)) + "\n")
 		lines := []string{
 			"  Navigation",
 			"    ↑↓ / j k       move cursor",
 			"    ← / h / Bksp   go up a level",
 			"    → / l / Enter   enter folder",
 			"    g / G           top / bottom",
+			"    s               toggle alphabetical / date-modified sort",
 			"",
 			"  Playback",
 			"    Enter           play file (replaces queue)",
@@ -446,6 +646,8 @@ func (m folderModel) View() string {
 			"",
 			"  Filter",
 			"    /               enter filter mode",
+			"    ← → Home End    move cursor within filter",
+			"    Backspace/Del   delete before/at cursor",
 			"    Esc             exit filter (filter remembered per folder)",
 			"",
 			"  Other",
@@ -458,10 +660,7 @@ func (m folderModel) View() string {
 			"    Esc / ? / q     close help",
 			"    q / ctrl+c      quit",
 		}
-		for _, l := range lines {
-			sb.WriteString(styleHelp.Render(l) + "\n")
-		}
-		return sb.String()
+		return renderScrollableHelp("Folder Browser — Key Bindings", lines, w, m.height, m.helpScroll)
 	}
 
 	sb.WriteString(stylePath.Render("  "+truncateStr(m.dir, w-2)) + "\n")
@@ -477,10 +676,7 @@ func (m folderModel) View() string {
 	extraLines := 0
 	if m.filterMode || m.filter != "" {
 		hits := fmt.Sprintf("  %d/%d", len(m.entries), len(m.allEntries))
-		prompt := "> " + m.filter
-		if m.filterMode {
-			prompt += "▌"
-		}
+		prompt := filterPromptText(m.filter, m.filterCursor, m.filterMode)
 		sb.WriteString("  " + styleFilter.Render(prompt) + styleDim.Render(hits) + "\n")
 		extraLines = 1
 	} else if len(m.selected) > 0 {
@@ -569,12 +765,13 @@ func (m folderModel) View() string {
 
 	var help string
 	artHint := [3]string{"i: art off", "i: chafa▸mpv", "i: mpv▸off"}[artMode]
+	sortHint := "s: sort " + map[folderSortMode]string{folderSortAlpha: "date-modified", folderSortModified: "alphabetical"}[m.sortMode]
 	if m.filterMode {
 		help = "  type to filter (space OK)  \u2191\u2193 navigate  Enter open/play  Backspace delete  Esc exit  Tab\u2192meta"
 	} else if len(m.selected) > 0 {
 		help = "  Space toggle  Enter queue  a append  ctrl+a all  Esc clear  / filter  Tab\u2192meta  q quit"
 	} else {
-		help = "  / filter  \u2191\u2193/jk move  \u2190\u2192/hl dir  Enter play  Space select  a append  r replace  n/N next/prev  p pause  " + artHint + "  v view  Tab\u2192meta  q quit"
+		help = "  / filter  \u2191\u2193/jk move  \u2190\u2192/hl dir  Enter play  Space select  a append  r replace  n/N next/prev  p pause  " + sortHint + "  " + artHint + "  v view  Tab\u2192meta  q quit"
 	}
 	sb.WriteString(styleHelp.Render(help))
 
@@ -586,9 +783,9 @@ func (m folderModel) View() string {
 
 // --- folder commands & helpers ---
 
-func navigateCmd(dir string) tea.Cmd {
+func navigateCmd(dir string, sortMode folderSortMode) tea.Cmd {
 	return func() tea.Msg {
-		entries, err := readDir(dir)
+		entries, err := readDir(dir, sortMode)
 		if err != nil {
 			return statusMsg{text: "Error: " + err.Error(), isErr: true}
 		}
@@ -727,7 +924,7 @@ func fileURI(path string) string {
 	return u.String()
 }
 
-func readDir(dir string) ([]entry, error) {
+func readDir(dir string, sortMode folderSortMode) ([]entry, error) {
 	des, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -740,7 +937,11 @@ func readDir(dir string) ([]entry, error) {
 		}
 		path := filepath.Join(dir, name)
 		if de.IsDir() {
-			dirs = append(dirs, entry{name: name, isDir: true, path: path})
+			modTime := time.Time{}
+			if info, err := de.Info(); err == nil {
+				modTime = info.ModTime()
+			}
+			dirs = append(dirs, entry{name: name, isDir: true, path: path, modTime: modTime})
 		} else {
 			ext := strings.ToLower(filepath.Ext(name))
 			if audioExts[ext] {
@@ -749,7 +950,18 @@ func readDir(dir string) ([]entry, error) {
 		}
 	}
 	sort.Slice(dirs, func(i, j int) bool {
-		return strings.ToLower(dirs[i].name) < strings.ToLower(dirs[j].name)
+		if strings.ToLower(dirs[i].name) == strings.ToLower(dirs[j].name) {
+			return dirs[i].name < dirs[j].name
+		}
+		switch sortMode {
+		case folderSortModified:
+			if dirs[i].modTime.Equal(dirs[j].modTime) {
+				return strings.ToLower(dirs[i].name) < strings.ToLower(dirs[j].name)
+			}
+			return dirs[i].modTime.After(dirs[j].modTime)
+		default:
+			return strings.ToLower(dirs[i].name) < strings.ToLower(dirs[j].name)
+		}
 	})
 	sort.Slice(files, func(i, j int) bool {
 		return strings.ToLower(files[i].name) < strings.ToLower(files[j].name)

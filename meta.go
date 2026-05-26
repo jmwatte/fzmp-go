@@ -65,17 +65,94 @@ type metaModel struct {
 	cursor   int
 	selected map[string]bool // keyed by track path; only meaningful at leaf stage
 
-	filter     string
-	filterMode bool
-	helpMode   bool
+	filter       string
+	filterCursor int
+	filterMode   bool
+	helpMode     bool
+	helpScroll   int
 
-	status string
-	isErr  bool
-	height int
-	width  int
+	status               string
+	isErr                bool
+	height               int
+	width                int
+	splitGenres          bool
+	splitGenreDelimiters []string
 
 	artContent string
 	artPath    string // path last submitted for rendering (stale-result guard)
+}
+
+func isGenreColumn(col string) bool {
+	return strings.EqualFold(strings.TrimSpace(col), "Genre")
+}
+
+func normalizeSplitDelimiters(delims []string) []string {
+	if len(delims) == 0 {
+		return []string{";"}
+	}
+	seen := make(map[string]bool, len(delims))
+	out := make([]string, 0, len(delims))
+	for _, d := range delims {
+		d = strings.TrimSpace(d)
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	if len(out) == 0 {
+		return []string{";"}
+	}
+	return out
+}
+
+func splitGenreValue(raw string, delims []string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []string{"Unknown"}
+	}
+	parts := []string{raw}
+	for _, delim := range normalizeSplitDelimiters(delims) {
+		next := make([]string, 0, len(parts))
+		for _, part := range parts {
+			next = append(next, strings.Split(part, delim)...)
+		}
+		parts = next
+	}
+	if len(parts) == 1 {
+		return []string{raw}
+	}
+	seen := make(map[string]bool, len(parts))
+	vals := make([]string, 0, len(parts))
+	for _, p := range parts {
+		v := strings.TrimSpace(p)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		vals = append(vals, v)
+	}
+	if len(vals) == 0 {
+		return []string{raw}
+	}
+	return vals
+}
+
+func (m *metaModel) facetValues(t track, col string) []string {
+	v := fieldVal(t, col)
+	if m.splitGenres && isGenreColumn(col) {
+		return splitGenreValue(v, m.splitGenreDelimiters)
+	}
+	return []string{v}
+}
+
+func (m *metaModel) trackMatchesFacet(t track, col, want string) bool {
+	for _, v := range m.facetValues(t, col) {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 var filterWordRE = regexp.MustCompile(`(?:[A-Za-z]+:)?"[^"]+"|\S+`)
@@ -217,17 +294,31 @@ func (m *metaModel) artRefreshCmd() tea.Cmd {
 		switch artMode {
 		case 1:
 			key, cmd := artChafaForDir(dir)
-			if key == m.artPath || cmd == nil {
+			if key != m.artPath && isTransientMosaicStatus(m.status, m.isErr) {
+				m.status = ""
+				m.isErr = false
+			}
+			if key == m.artPath {
 				return nil
 			}
 			m.artPath = key
+			if cmd == nil {
+				return nil
+			}
 			return cmd
 		case 2:
 			key, cmd := openArtViewerForDir(dir)
-			if key == m.artPath || cmd == nil {
+			if key != m.artPath && isTransientMosaicStatus(m.status, m.isErr) {
+				m.status = ""
+				m.isErr = false
+			}
+			if key == m.artPath {
 				return nil
 			}
 			m.artPath = key
+			if cmd == nil {
+				return nil
+			}
 			return cmd
 		}
 		return nil
@@ -243,6 +334,10 @@ func (m *metaModel) artRefreshCmd() tea.Cmd {
 	}
 	sort.Strings(covers)
 	key := strings.Join(covers, "|")
+	if key != m.artPath && isTransientMosaicStatus(m.status, m.isErr) {
+		m.status = ""
+		m.isErr = false
+	}
 	if key == m.artPath {
 		return nil
 	}
@@ -280,7 +375,7 @@ func (m *metaModel) hoveredItemCovers() []string {
 		if !m.trackMatchesSelections(t) {
 			continue
 		}
-		if fieldVal(t, col) != hoveredVal {
+		if !m.trackMatchesFacet(t, col, hoveredVal) {
 			continue
 		}
 		dir := filepath.Dir(t.path)
@@ -314,10 +409,12 @@ func initialMetaModel(cfg appConfig) metaModel {
 		csvP = filepath.Join(appdata, "fzmp", "metadata-cache.csv")
 	}
 	return metaModel{
-		csvPath:      csvP,
-		layout:       layouts[0].Levels,
-		stageCursors: make(map[int]int),
-		stageFilters: make(map[int]string), selected: make(map[string]bool), height: 24,
+		csvPath:              csvP,
+		layout:               layouts[0].Levels,
+		splitGenres:          cfg.Meta.SplitGenres,
+		splitGenreDelimiters: normalizeSplitDelimiters(cfg.Meta.SplitGenreDelimiters),
+		stageCursors:         make(map[int]int),
+		stageFilters:         make(map[int]string), selected: make(map[string]bool), height: 24,
 	}
 }
 
@@ -345,7 +442,7 @@ func fieldVal(t track, col string) string {
 // trackMatchesSelections returns true if the track satisfies all current drill-down selections.
 func (m *metaModel) trackMatchesSelections(t track) bool {
 	for i, col := range m.layout[:m.stage] {
-		if fieldVal(t, col) != m.selections[i] {
+		if !m.trackMatchesFacet(t, col, m.selections[i]) {
 			return false
 		}
 	}
@@ -420,30 +517,33 @@ func (m *metaModel) computeAllItems() {
 		if !m.trackMatchesSelections(t) {
 			continue
 		}
-		val := fieldVal(t, col)
-		counts[val]++
-		if _, ok := searchSets[val]; !ok {
-			seed := map[string]bool{strings.ToLower(val): true}
-			for _, sel := range m.selections {
-				seed[strings.ToLower(sel)] = true
+		for _, val := range m.facetValues(t, col) {
+			counts[val]++
+			if _, ok := searchSets[val]; !ok {
+				seed := map[string]bool{strings.ToLower(val): true}
+				for _, sel := range m.selections {
+					seed[strings.ToLower(sel)] = true
+				}
+				searchSets[val] = seed
 			}
-			searchSets[val] = seed
-		}
-		if _, ok := docSets[val]; !ok {
-			docSets[val] = make(map[string]bool)
-		}
+			if _, ok := docSets[val]; !ok {
+				docSets[val] = make(map[string]bool)
+			}
 
-		docParts := make([]string, 0, len(m.selections)+1+len(m.layout[m.stage+1:]))
-		for _, sel := range m.selections {
-			docParts = append(docParts, strings.ToLower(sel))
+			docParts := make([]string, 0, len(m.selections)+1+len(m.layout[m.stage+1:]))
+			for _, sel := range m.selections {
+				docParts = append(docParts, strings.ToLower(sel))
+			}
+			docParts = append(docParts, strings.ToLower(val))
+			for _, c := range m.layout[m.stage+1:] {
+				for _, fv := range m.facetValues(t, c) {
+					lfv := strings.ToLower(fv)
+					searchSets[val][lfv] = true
+					docParts = append(docParts, lfv)
+				}
+			}
+			docSets[val][strings.Join(docParts, "\x1f")] = true
 		}
-		docParts = append(docParts, strings.ToLower(val))
-		for _, c := range m.layout[m.stage+1:] {
-			fv := strings.ToLower(fieldVal(t, c))
-			searchSets[val][fv] = true
-			docParts = append(docParts, fv)
-		}
-		docSets[val][strings.Join(docParts, "\x1f")] = true
 	}
 
 	items := make([]metaItem, 0, len(counts))
@@ -746,7 +846,7 @@ func (m *metaModel) playCurrent() tea.Cmd {
 	for _, t := range m.tracks {
 		match := true
 		for i, col := range targetCols {
-			if fieldVal(t, col) != targetSels[i] {
+			if !m.trackMatchesFacet(t, col, targetSels[i]) {
 				match = false
 				break
 			}
@@ -789,7 +889,7 @@ func (m *metaModel) appendCurrent() tea.Cmd {
 	for _, t := range m.tracks {
 		match := true
 		for i, col := range targetCols {
-			if fieldVal(t, col) != targetSels[i] {
+			if !m.trackMatchesFacet(t, col, targetSels[i]) {
 				match = false
 				break
 			}
@@ -899,6 +999,9 @@ func (m metaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case statusMsg:
+		if msg.path != "" && msg.path != m.artPath {
+			return m, nil
+		}
 		m.status = msg.text
 		m.isErr = msg.isErr
 		return m, nil
@@ -912,12 +1015,25 @@ func (m metaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.helpMode {
 			switch k {
+			case "up", "k", "pgup", "pageup":
+				m.helpScroll--
+				return m, nil
+			case "down", "j", "pgdown", "pagedown":
+				m.helpScroll++
+				return m, nil
+			case "home", "g":
+				m.helpScroll = 0
+				return m, nil
+			case "end", "G":
+				m.helpScroll = 1 << 30
+				return m, nil
 			case "o":
 				return m, openConfigCmd(false)
 			case "O":
 				return m, openConfigCmd(true)
 			case "esc", "?", "q", "enter", " ":
 				m.helpMode = false
+				m.helpScroll = 0
 				return m, nil
 			}
 			return m, nil
@@ -931,6 +1047,7 @@ func (m metaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.filterMode {
 				m.filterMode = false
 				m.filter = ""
+				m.filterCursor = 0
 				m.computeAllItems()
 				m.applyFilter()
 				m.cursor = 0
@@ -942,6 +1059,8 @@ func (m metaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.filterMode {
+			runes := []rune(m.filter)
+			m.filterCursor = clampInt(m.filterCursor, 0, len(runes))
 			switch k {
 			case "up":
 				if m.cursor > 0 {
@@ -951,26 +1070,47 @@ func (m metaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.cursor < len(m.items)-1 {
 					m.cursor++
 				}
+			case "left":
+				if m.filterCursor > 0 {
+					m.filterCursor--
+				}
+			case "right":
+				if m.filterCursor < len(runes) {
+					m.filterCursor++
+				}
+			case "home":
+				m.filterCursor = 0
+			case "end":
+				m.filterCursor = len(runes)
 			case "enter":
 				m.filterMode = false
 				cmd := m.drillIn()
 				return m, cmd
 			case " ":
-				m.filter += " "
+				m.filter = string(runes[:m.filterCursor]) + " " + string(runes[m.filterCursor:])
+				m.filterCursor++
 				m.applyFilter()
 				m.cursor = 0
 			case "backspace":
-				if m.filter != "" {
-					runes := []rune(m.filter)
-					m.filter = string(runes[:len(runes)-1])
+				if m.filterCursor > 0 {
+					m.filter = string(runes[:m.filterCursor-1]) + string(runes[m.filterCursor:])
+					m.filterCursor--
 					m.applyFilter()
+					m.cursor = 0
 				} else {
 					m.filterMode = false
+				}
+			case "delete":
+				if m.filterCursor < len(runes) {
+					m.filter = string(runes[:m.filterCursor]) + string(runes[m.filterCursor+1:])
+					m.applyFilter()
+					m.cursor = 0
 				}
 			default:
 				runes := []rune(k)
 				if len(runes) == 1 && runes[0] >= 32 {
-					m.filter += k
+					m.filter = string([]rune(m.filter)[:m.filterCursor]) + k + string([]rune(m.filter)[m.filterCursor:])
+					m.filterCursor += len(runes)
 					m.applyFilter()
 					m.cursor = 0
 				}
@@ -1019,6 +1159,7 @@ func (m metaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "/":
 			m.filterMode = true
+			m.filterCursor = len([]rune(m.filter))
 		case "a":
 			cmd := m.appendCurrent()
 			return m, cmd
@@ -1067,6 +1208,25 @@ func (m metaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.switchLayout(+1)
 		case "H":
 			m.switchLayout(-1)
+		case "s":
+			m.splitGenres = !m.splitGenres
+			m.stage = 0
+			m.selections = nil
+			m.stageCursors = make(map[int]int)
+			m.stageFilters = make(map[int]string)
+			m.selected = make(map[string]bool)
+			m.filter = ""
+			m.filterMode = false
+			m.filterCursor = 0
+			m.computeAllItems()
+			m.applyFilter()
+			m.cursor = 0
+			if m.splitGenres {
+				m.status = "Genre split: on"
+			} else {
+				m.status = "Genre split: off"
+			}
+			m.isErr = false
 		}
 	}
 
@@ -1084,9 +1244,6 @@ func (m metaModel) View() string {
 	if m.helpMode {
 		cfgFile := configPath()
 		cfgDir := filepath.Dir(cfgFile)
-
-		sb.WriteString(stylePath.Render("  Meta Browser — Key Bindings") + "\n")
-		sb.WriteString(styleDim.Render(strings.Repeat("─", w)) + "\n")
 		lines := []string{
 			"  Navigation",
 			"    ↑↓ / j k       move cursor",
@@ -1119,6 +1276,7 @@ func (m metaModel) View() string {
 			"    Example:  artist:bach genre:classical  or  album:london help", "",
 			"  Layouts",
 			"    L / H           cycle layouts forward / back",
+			"    s               toggle split Genre values on ';'",
 			"",
 			"  Other",
 			"    i               toggle album art panel",
@@ -1130,10 +1288,7 @@ func (m metaModel) View() string {
 			"    Esc / ? / q     close help",
 			"    q / ctrl+c      quit",
 		}
-		for _, l := range lines {
-			sb.WriteString(styleHelp.Render(l) + "\n")
-		}
-		return sb.String()
+		return renderScrollableHelp("Meta Browser — Key Bindings", lines, w, m.height, m.helpScroll)
 	}
 
 	sb.WriteString(stylePath.Render("  "+truncateStr(m.breadcrumb(), w-2)) + "\n")
@@ -1160,10 +1315,7 @@ func (m metaModel) View() string {
 	if m.filterMode || m.filter != "" {
 		hits := fmt.Sprintf("  %d/%d", len(m.items), len(m.allItems))
 		hint := activeFilterHints(m.filter)
-		prompt := "> " + m.filter
-		if m.filterMode {
-			prompt += "▌"
-		}
+		prompt := filterPromptText(m.filter, m.filterCursor, m.filterMode)
 		sb.WriteString("  " + styleFilter.Render(prompt) + styleDim.Render(hits+hint) + "\n")
 		extraLines = 1
 	}
@@ -1244,11 +1396,11 @@ func (m metaModel) View() string {
 	artHint := [3]string{"i: art off", "i: chafa\u25b8mpv", "i: mpv\u25b8off"}[artMode]
 	var help string
 	if m.filterMode {
-		help = "  type to filter  ↑↓ navigate  Enter select  Backspace delete  Esc exit filter"
+		help = "  type to filter  ↑↓ navigate  ←→ move cursor  Home/End jump  Enter select  Backspace delete  Del delete  Esc exit filter"
 	} else if isLeaf {
-		help = "  Enter play  a append  r replace  n/N next/prev  ↑↓/jk  ← back  / filter  L/H layouts  " + artHint + "  v view  Tab→folders  p pause  q quit"
+		help = "  Enter play  a append  r replace  n/N next/prev  ↑↓/jk  ← back  / filter  L/H layouts  s split-genre  " + artHint + "  v view  Tab→folders  p pause  q quit"
 	} else {
-		help = "  Enter drill down  a queue all  r replace  n/N next/prev  ↑↓/jk  ← back  / filter  L/H layouts  " + artHint + "  Tab→folders  q quit"
+		help = "  Enter drill down  a queue all  r replace  n/N next/prev  ↑↓/jk  ← back  / filter  L/H layouts  s split-genre  " + artHint + "  Tab→folders  q quit"
 	}
 	sb.WriteString(styleHelp.Render(help))
 

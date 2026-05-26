@@ -39,6 +39,9 @@ var (
 type statusMsg struct {
 	text  string
 	isErr bool
+	// path scopes async status to a specific art target key/path.
+	// Empty means global/non-art status.
+	path string
 }
 
 // --- shared mpv commands ---
@@ -161,6 +164,8 @@ func main() {
 	mpvPath = cfg.MpvPath
 	chafaPath = cfg.ChafaPath
 	ffmpegPath = cfg.FfmpegPath
+	artViewerAutoResize = cfg.ArtViewerAutoResize
+	artViewerSize = cfg.ArtViewerSize
 
 	if importListPath != "" {
 		opts := importListOptions{
@@ -194,7 +199,7 @@ func main() {
 	}
 
 	app := appModel{
-		folder: initialFolderModel(root),
+		folder: initialFolderModel(root, cfg),
 		meta:   initialMetaModel(cfg),
 	}
 

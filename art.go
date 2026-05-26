@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,9 +59,11 @@ var noArtPath string
 
 // mpvPath, chafaPath, ffmpegPath are executable paths; default to PATH resolution.
 var (
-	mpvPath    = "mpv"
-	chafaPath  = "chafa"
-	ffmpegPath = "ffmpeg"
+	mpvPath             = "mpv"
+	chafaPath           = "chafa"
+	ffmpegPath          = "ffmpeg"
+	artViewerAutoResize = true
+	artViewerSize       = "800x800"
 )
 
 // artMode is the shared art display mode across all views.
@@ -141,67 +145,210 @@ func mosaicCachePath(paths []string) string {
 	return filepath.Join(os.TempDir(), "fzmp-art-cache", name)
 }
 
-// buildMosaicImage tiles paths into a single composite JPEG at outPath using
-// ffmpeg xstack.  Each cell is scaled to cellSize×cellSize (letterboxed).
-// Empty grid cells are filled with a cached black PNG so they aren't green.
-func buildMosaicImage(paths []string, outPath string) error {
-	const cellSize = 256
-	n := len(paths)
-	// Use ceil(sqrt(n)) columns to keep the grid roughly square.
-	cols := 1
+const (
+	mosaicCellSize       = 256
+	mosaicChunkSize      = 16
+	mosaicCmdMaxEstimate = 30000
+)
+
+func mosaicGrid(n int) (cols, rows, total int) {
+	if n < 1 {
+		return 1, 1, 1
+	}
+	cols = 1
 	for cols*cols < n {
 		cols++
 	}
-	rows := (n + cols - 1) / cols
-	total := cols * rows
+	rows = (n + cols - 1) / cols
+	total = cols * rows
+	return cols, rows, total
+}
 
-	// Pad the input list with a black cell image to fill the grid completely.
-	if total > n {
-		blackCell := filepath.Join(filepath.Dir(outPath), "black-cell.png")
-		if _, err := os.Stat(blackCell); os.IsNotExist(err) {
-			exec.Command(ffmpegPath, "-y", "-f", "lavfi",
-				"-i", fmt.Sprintf("color=black:size=%dx%d:rate=1", cellSize, cellSize),
-				"-frames:v", "1", blackCell).Run() //nolint
-		}
-		for i := n; i < total; i++ {
-			paths = append(paths, blackCell)
-		}
-		n = total
-	}
-
-	args := []string{"-y"}
-	for _, p := range paths {
-		args = append(args, "-i", p)
-	}
-
+func mosaicFilter(n, cols, cellSize int) string {
 	scaleFilter := fmt.Sprintf(
 		"scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2",
 		cellSize, cellSize, cellSize, cellSize,
 	)
 
 	var filter strings.Builder
-	for i := range paths {
+	for i := 0; i < n; i++ {
 		fmt.Fprintf(&filter, "[%d:v]%s[v%d];", i, scaleFilter, i)
 	}
-	for i := range paths {
+	for i := 0; i < n; i++ {
 		fmt.Fprintf(&filter, "[v%d]", i)
 	}
 	fmt.Fprintf(&filter, "xstack=inputs=%d:layout=", n)
-	for i := range paths {
+	for i := 0; i < n; i++ {
 		if i > 0 {
 			filter.WriteString("|")
 		}
 		fmt.Fprintf(&filter, "%d_%d", (i%cols)*cellSize, (i/cols)*cellSize)
 	}
 	filter.WriteString(":shortest=1[out]")
+	return filter.String()
+}
 
-	args = append(args, "-filter_complex", filter.String(),
+func ensureBlackCell(outPath string, cellSize int) (string, error) {
+	blackCell := filepath.Join(filepath.Dir(outPath), "black-cell.png")
+	if _, err := os.Stat(blackCell); err == nil {
+		return blackCell, nil
+	}
+
+	cmd := exec.Command(ffmpegPath, "-y", "-f", "lavfi",
+		"-i", fmt.Sprintf("color=black:size=%dx%d:rate=1", cellSize, cellSize),
+		"-frames:v", "1", blackCell)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			return "", fmt.Errorf("ffmpeg black-cell failed: %w", err)
+		}
+		return "", fmt.Errorf("ffmpeg black-cell failed: %w: %s", err, msg)
+	}
+
+	return blackCell, nil
+}
+
+func estimateMosaicCmdLen(paths []string, outPath string) int {
+	if len(paths) == 0 {
+		return 0
+	}
+	cols, _, total := mosaicGrid(len(paths))
+	blackCell := filepath.Join(filepath.Dir(outPath), "black-cell.png")
+
+	args := []string{"-y"}
+	for _, p := range paths {
+		args = append(args, "-i", p)
+	}
+	for i := len(paths); i < total; i++ {
+		args = append(args, "-i", blackCell)
+	}
+
+	args = append(args, "-filter_complex", mosaicFilter(total, cols, mosaicCellSize),
+		"-map", "[out]", "-frames:v", "1", outPath)
+
+	n := len(ffmpegPath)
+	for _, a := range args {
+		n += 1 + len(a)
+	}
+	return n
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Close()
+}
+
+func buildMosaicImageDirect(paths []string, outPath string) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("no images to mosaic")
+	}
+	if len(paths) == 1 {
+		if filepath.Clean(paths[0]) == filepath.Clean(outPath) {
+			return nil
+		}
+		return copyFile(paths[0], outPath)
+	}
+
+	cols, _, total := mosaicGrid(len(paths))
+	padded := make([]string, 0, total)
+	padded = append(padded, paths...)
+
+	if total > len(paths) {
+		blackCell, err := ensureBlackCell(outPath, mosaicCellSize)
+		if err != nil {
+			return err
+		}
+		for i := len(paths); i < total; i++ {
+			padded = append(padded, blackCell)
+		}
+	}
+
+	args := []string{"-y"}
+	for _, p := range padded {
+		args = append(args, "-i", p)
+	}
+
+	args = append(args, "-filter_complex", mosaicFilter(len(padded), cols, mosaicCellSize),
 		"-map", "[out]", "-frames:v", "1", outPath)
 
 	cmd := exec.Command(ffmpegPath, args...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	return cmd.Run()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			return fmt.Errorf("ffmpeg mosaic failed: %w", err)
+		}
+		return fmt.Errorf("ffmpeg mosaic failed: %w: %s", err, msg)
+	}
+	return nil
+}
+
+func buildMosaicImageChunked(paths []string, outPath string) error {
+	stageDir, err := os.MkdirTemp(filepath.Dir(outPath), "mosaic-stage-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stageDir)
+
+	current := append([]string(nil), paths...)
+	for level := 0; ; level++ {
+		if len(current) == 0 {
+			return fmt.Errorf("no images to mosaic")
+		}
+		if estimateMosaicCmdLen(current, outPath) <= mosaicCmdMaxEstimate {
+			return buildMosaicImageDirect(current, outPath)
+		}
+
+		next := make([]string, 0, (len(current)+mosaicChunkSize-1)/mosaicChunkSize)
+		for i, chunkIdx := 0, 0; i < len(current); chunkIdx++ {
+			chunkOut := filepath.Join(stageDir, fmt.Sprintf("lvl%02d_%04d.jpg", level, chunkIdx))
+			end := i + mosaicChunkSize
+			if end > len(current) {
+				end = len(current)
+			}
+			for end > i+1 && estimateMosaicCmdLen(current[i:end], chunkOut) > mosaicCmdMaxEstimate {
+				end--
+			}
+			if err := buildMosaicImageDirect(current[i:end], chunkOut); err != nil {
+				return err
+			}
+			next = append(next, chunkOut)
+			i = end
+		}
+		current = next
+	}
+}
+
+// buildMosaicImage tiles paths into a single composite JPEG at outPath using
+// ffmpeg xstack.  Each cell is scaled to cellSize×cellSize (letterboxed).
+// Empty grid cells are filled with a cached black PNG so they aren't green.
+func buildMosaicImage(paths []string, outPath string) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("no images to mosaic")
+	}
+
+	if estimateMosaicCmdLen(paths, outPath) <= mosaicCmdMaxEstimate {
+		return buildMosaicImageDirect(paths, outPath)
+	}
+
+	return buildMosaicImageChunked(paths, outPath)
 }
 
 // renderArtGridCmd builds a mosaic from paths (via ffmpeg, disk-cached) then
@@ -211,20 +358,14 @@ func renderArtGridCmd(paths []string) tea.Cmd {
 		key := strings.Join(paths, "|")
 
 		cachePath := mosaicCachePath(paths)
-
-		if _, err := os.Stat(cachePath); os.IsNotExist(err) {
-			if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
-				return artMsg{path: key}
-			}
-			if err := buildMosaicImage(paths, cachePath); err != nil {
-				return artMsg{path: key}
-			}
+		if err := ensureMosaicCached(paths, cachePath); err != nil {
+			return statusMsg{text: "mosaic build failed: " + err.Error(), isErr: true, path: key}
 		}
 
 		size := fmt.Sprintf("%dx%d", artW, artH)
 		out, err := exec.Command(chafaPath, "--format", "symbols", "--size", size, cachePath).Output()
 		if err != nil {
-			return artMsg{path: key}
+			return statusMsg{text: "mosaic render failed: " + err.Error(), isErr: true, path: key}
 		}
 		content := strings.ReplaceAll(string(out), "\r", "")
 		content = ansiEraseRe.ReplaceAllString(content, "")
@@ -236,6 +377,13 @@ func renderArtGridCmd(paths []string) tea.Cmd {
 // cursor — these must be stripped from chafa output before embedding art lines
 // alongside list text, otherwise they erase the list content to the right.
 var ansiEraseRe = regexp.MustCompile(`\x1b\[(?:[0-9;]*[JK]|\?25[lh])`)
+
+func isTransientMosaicStatus(text string, isErr bool) bool {
+	if !isErr {
+		return false
+	}
+	return strings.HasPrefix(text, "mosaic build failed:") || strings.HasPrefix(text, "mosaic render failed:")
+}
 
 // renderArtCmd runs chafa in a goroutine and returns an artMsg.
 func renderArtCmd(path string) tea.Cmd {
@@ -297,7 +445,50 @@ const artPipeName = "fzmp-art"
 var (
 	artViewerProc *os.Process
 	artViewerMu   sync.Mutex
+	mosaicBuildMu sync.Mutex
+	mosaicBuilds  = make(map[string]chan struct{})
 )
+
+// ensureMosaicCached guarantees only one build per cachePath runs at once.
+// Concurrent callers wait for the active build and then reuse its result.
+func ensureMosaicCached(paths []string, cachePath string) error {
+	if _, err := os.Stat(cachePath); err == nil {
+		return nil
+	}
+
+	for {
+		mosaicBuildMu.Lock()
+		waitCh, inFlight := mosaicBuilds[cachePath]
+		if !inFlight {
+			waitCh = make(chan struct{})
+			mosaicBuilds[cachePath] = waitCh
+			mosaicBuildMu.Unlock()
+
+			var buildErr error
+			if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+				buildErr = err
+			} else {
+				buildErr = buildMosaicImage(paths, cachePath)
+			}
+
+			mosaicBuildMu.Lock()
+			delete(mosaicBuilds, cachePath)
+			close(waitCh)
+			mosaicBuildMu.Unlock()
+
+			return buildErr
+		}
+		mosaicBuildMu.Unlock()
+
+		// Another goroutine is already building this exact mosaic. Wait for it,
+		// then use the resulting cache file if available.
+		<-waitCh
+		if _, err := os.Stat(cachePath); err == nil {
+			return nil
+		}
+		// Previous build failed; retry as the new builder.
+	}
+}
 
 // openArtViewer sends a loadfile command to an already-running mpv art viewer
 // via IPC so the window keeps focus.  If mpv isn't running yet it starts it
@@ -331,16 +522,20 @@ func openArtViewer(artPath string) tea.Cmd {
 
 		// Start a fresh mpv art viewer with the IPC pipe so subsequent images
 		// can be sent without reopening the window.
-		cmd := exec.Command(mpvPath,
+		args := []string{
 			"--no-audio",
 			"--image-display-duration=inf",
-			"--autofit=800x800",
 			"--title=fzmp art viewer",
 			"--no-osc",
 			"--no-terminal",
-			"--input-ipc-server="+`\\.\pipe\`+artPipeName,
-			artPath,
-		)
+			"--input-ipc-server=" + `\\.\pipe\` + artPipeName,
+		}
+		if artViewerAutoResize {
+			args = append(args, "--autofit="+artViewerSize)
+		} else {
+			args = append(args, "--auto-window-resize=no", "--geometry="+artViewerSize)
+		}
+		cmd := exec.Command(mpvPath, append(args, artPath)...)
 		if err := cmd.Start(); err != nil {
 			return statusMsg{text: "art viewer: " + err.Error(), isErr: true}
 		}
@@ -383,13 +578,9 @@ func openArtViewerForDir(dir string) (key string, cmd tea.Cmd) {
 // persistent mpv art viewer.
 func openArtViewerMosaic(paths []string, cachePath string) tea.Cmd {
 	return func() tea.Msg {
-		if _, err := os.Stat(cachePath); os.IsNotExist(err) {
-			if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
-				return nil
-			}
-			if err := buildMosaicImage(paths, cachePath); err != nil {
-				return nil
-			}
+		key := strings.Join(paths, "|")
+		if err := ensureMosaicCached(paths, cachePath); err != nil {
+			return statusMsg{text: "mosaic build failed: " + err.Error(), isErr: true, path: key}
 		}
 		return openArtViewer(cachePath)()
 	}
