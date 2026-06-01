@@ -46,6 +46,7 @@ type metaLoadedMsg struct {
 
 type metaModel struct {
 	csvPath      string
+	musicRoot    string
 	tracks       []track
 	headers      []string // columns available in the CSV
 	loaded       bool
@@ -57,6 +58,7 @@ type metaModel struct {
 
 	stage        int      // 0..len(layout); len(layout) == track list
 	selections   []string // one entry per completed stage
+	releaseDir   string   // selected release folder when disambiguating identical album names
 	stageCursors map[int]int
 	stageFilters map[int]string // saved filter string per stage
 
@@ -80,6 +82,87 @@ type metaModel struct {
 
 	artContent string
 	artPath    string // path last submitted for rendering (stale-result guard)
+}
+
+const releaseFacetColumn = "__release_folder"
+
+func releaseFolderForTrack(t track) string {
+	return filepath.Dir(t.path)
+}
+
+func shortReleaseLabel(dir, root string) string {
+	dir = filepath.Clean(strings.TrimSpace(dir))
+	if dir == "" {
+		return "Unknown"
+	}
+	if root != "" {
+		if rel, err := filepath.Rel(root, dir); err == nil && rel != "" && rel != "." && !strings.HasPrefix(rel, "..") {
+			return rel
+		}
+	}
+	base := filepath.Base(dir)
+	parent := filepath.Base(filepath.Dir(dir))
+	if parent == "." || parent == string(filepath.Separator) || parent == "" || parent == base {
+		return base
+	}
+	return parent + string(filepath.Separator) + base
+}
+
+func (m *metaModel) releaseStageNeeded() bool {
+	if m.stage < len(m.layout) {
+		return false
+	}
+	seen := make(map[string]bool)
+	for _, t := range m.tracks {
+		if !m.trackMatchesSelections(t) {
+			continue
+		}
+		d := releaseFolderForTrack(t)
+		if d == "" {
+			continue
+		}
+		if !seen[d] {
+			seen[d] = true
+			if len(seen) > 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (m *metaModel) atReleaseStage() bool {
+	return m.stage == len(m.layout) && m.releaseDir == "" && m.releaseStageNeeded()
+}
+
+func (m *metaModel) atTrackLeaf() bool {
+	if m.stage < len(m.layout) {
+		return false
+	}
+	if m.releaseDir != "" {
+		return true
+	}
+	return !m.releaseStageNeeded()
+}
+
+func (m *metaModel) stageColumn() string {
+	if m.atReleaseStage() {
+		return releaseFacetColumn
+	}
+	if m.stage < len(m.layout) {
+		return m.layout[m.stage]
+	}
+	return ""
+}
+
+func (m *metaModel) trackMatchesContext(t track) bool {
+	if !m.trackMatchesSelections(t) {
+		return false
+	}
+	if m.releaseDir != "" && releaseFolderForTrack(t) != m.releaseDir {
+		return false
+	}
+	return true
 }
 
 func isGenreColumn(col string) bool {
@@ -139,6 +222,13 @@ func splitGenreValue(raw string, delims []string) []string {
 }
 
 func (m *metaModel) facetValues(t track, col string) []string {
+	if col == releaseFacetColumn {
+		dir := releaseFolderForTrack(t)
+		if dir == "" {
+			return []string{"Unknown"}
+		}
+		return []string{dir}
+	}
 	v := fieldVal(t, col)
 	if m.splitGenres && isGenreColumn(col) {
 		return splitGenreValue(v, m.splitGenreDelimiters)
@@ -229,7 +319,7 @@ func (m *metaModel) itemMatchesRegex(item metaItem, rx *regexp.Regexp) bool {
 	if rx == nil {
 		return true
 	}
-	if m.stage == len(m.layout) {
+	if m.atTrackLeaf() {
 		return rx.MatchString(item.search)
 	}
 	for _, d := range item.docs {
@@ -283,7 +373,7 @@ func (m *metaModel) artRefreshCmd() tea.Cmd {
 	if artMode == 0 {
 		return nil
 	}
-	isLeaf := m.stage == len(m.layout)
+	isLeaf := m.atTrackLeaf()
 
 	if isLeaf {
 		// Leaf: derive album dir from the track path and use the same logic as folder view.
@@ -367,7 +457,10 @@ func (m *metaModel) hoveredItemCovers() []string {
 		return nil
 	}
 	hoveredVal := m.items[m.cursor].key
-	col := m.layout[m.stage]
+	col := m.stageColumn()
+	if col == "" {
+		return nil
+	}
 
 	seen := make(map[string]bool)
 	var covers []string
@@ -410,6 +503,7 @@ func initialMetaModel(cfg appConfig) metaModel {
 	}
 	return metaModel{
 		csvPath:              csvP,
+		musicRoot:            cfg.MusicRoot,
 		layout:               layouts[0].Levels,
 		splitGenres:          cfg.Meta.SplitGenres,
 		splitGenreDelimiters: normalizeSplitDelimiters(cfg.Meta.SplitGenreDelimiters),
@@ -449,12 +543,53 @@ func (m *metaModel) trackMatchesSelections(t track) bool {
 	return true
 }
 
+func (m *metaModel) selectedTrackPaths() []string {
+	if len(m.selected) == 0 || len(m.allItems) == 0 {
+		return nil
+	}
+
+	if m.atTrackLeaf() {
+		paths := make([]string, 0, len(m.selected))
+		for _, item := range m.allItems {
+			if m.selected[item.key] {
+				paths = append(paths, item.key)
+			}
+		}
+		return paths
+	}
+
+	col := m.stageColumn()
+	if col == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var paths []string
+	for _, t := range m.tracks {
+		if !m.trackMatchesSelections(t) {
+			continue
+		}
+		for key := range m.selected {
+			if !m.trackMatchesFacet(t, col, key) {
+				continue
+			}
+			if seen[t.path] {
+				continue
+			}
+			seen[t.path] = true
+			paths = append(paths, t.path)
+			break
+		}
+	}
+	sort.Strings(paths)
+	return paths
+}
+
 func (m *metaModel) computeAllItems() {
-	if m.stage == len(m.layout) {
+	if m.atTrackLeaf() {
 		// Leaf: collect matching tracks
 		var result []track
 		for _, t := range m.tracks {
-			if m.trackMatchesSelections(t) {
+			if m.trackMatchesContext(t) {
 				result = append(result, t)
 			}
 		}
@@ -509,10 +644,18 @@ func (m *metaModel) computeAllItems() {
 	}
 
 	// Intermediate: group matching tracks by current level column
-	col := m.layout[m.stage]
+	col := m.stageColumn()
+	if col == "" {
+		m.allItems = nil
+		return
+	}
 	counts := make(map[string]int)
 	searchSets := make(map[string]map[string]bool)
 	docSets := make(map[string]map[string]bool)
+	nextCols := []string(nil)
+	if m.stage+1 < len(m.layout) {
+		nextCols = m.layout[m.stage+1:]
+	}
 	for _, t := range m.tracks {
 		if !m.trackMatchesSelections(t) {
 			continue
@@ -530,12 +673,12 @@ func (m *metaModel) computeAllItems() {
 				docSets[val] = make(map[string]bool)
 			}
 
-			docParts := make([]string, 0, len(m.selections)+1+len(m.layout[m.stage+1:]))
+			docParts := make([]string, 0, len(m.selections)+1+len(nextCols))
 			for _, sel := range m.selections {
 				docParts = append(docParts, strings.ToLower(sel))
 			}
 			docParts = append(docParts, strings.ToLower(val))
-			for _, c := range m.layout[m.stage+1:] {
+			for _, c := range nextCols {
 				for _, fv := range m.facetValues(t, c) {
 					lfv := strings.ToLower(fv)
 					searchSets[val][lfv] = true
@@ -548,11 +691,18 @@ func (m *metaModel) computeAllItems() {
 
 	items := make([]metaItem, 0, len(counts))
 	for val, count := range counts {
-		display := fmt.Sprintf("%s  (%d)", val, count)
-		sk := strings.ToLower(val)
+		displayVal := val
+		if col == releaseFacetColumn {
+			displayVal = shortReleaseLabel(val, m.musicRoot)
+		}
+		display := fmt.Sprintf("%s  (%d)", displayVal, count)
+		sk := strings.ToLower(displayVal)
 		set := searchSets[val]
 		parts := make([]string, 0, len(set)+1)
 		parts = append(parts, strings.ToLower(display))
+		if col == releaseFacetColumn {
+			parts = append(parts, strings.ToLower(val))
+		}
 		for s := range set {
 			parts = append(parts, s)
 		}
@@ -638,7 +788,7 @@ func (m *metaModel) itemMatchesTokens(item metaItem, tokens []filterToken) bool 
 		itemSearch = strings.ToLower(item.display)
 	}
 
-	if m.stage == len(m.layout) {
+	if m.atTrackLeaf() {
 		t, ok := m.tracksByPath[item.key]
 		if !ok {
 			return false
@@ -767,13 +917,24 @@ func (m *metaModel) drillIn() tea.Cmd {
 	m.stageCursors[m.stage] = m.cursor
 	parentFilter := m.filter
 
-	if m.stage == len(m.layout) {
+	if m.atTrackLeaf() {
 		return playCmd(item.key, false)
+	}
+
+	if m.atReleaseStage() {
+		m.releaseDir = item.key
+		m.selected = make(map[string]bool)
+		m.filterMode = false
+		m.computeAllItems()
+		m.applyFilter()
+		m.restoreCursor()
+		return nil
 	}
 
 	m.stageFilters[m.stage] = m.filter // save current filter before descending
 	m.selections = append(m.selections, item.key)
 	m.stage++
+	m.releaseDir = ""
 	m.selected = make(map[string]bool) // clear selection when changing stage
 	// Prefer the currently active query when drilling in; fall back to this
 	// stage's remembered query only when parent has no active filter.
@@ -789,6 +950,15 @@ func (m *metaModel) drillIn() tea.Cmd {
 }
 
 func (m *metaModel) goBack() {
+	if m.releaseDir != "" && m.stage == len(m.layout) {
+		m.releaseDir = ""
+		m.selected = make(map[string]bool)
+		m.filterMode = false
+		m.computeAllItems()
+		m.applyFilter()
+		m.restoreCursor()
+		return
+	}
 	if m.stage == 0 {
 		return
 	}
@@ -797,6 +967,7 @@ func (m *metaModel) goBack() {
 	m.stage--
 	m.selected = make(map[string]bool) // clear selection when changing stage
 	m.selections = m.selections[:m.stage]
+	m.releaseDir = ""
 	m.filter = m.stageFilters[m.stage] // restore the filter that was active at this stage
 	m.filterMode = false
 	m.computeAllItems()
@@ -809,14 +980,7 @@ func (m *metaModel) playCurrent() tea.Cmd {
 		return nil
 	}
 
-	// At leaf with selection: replace queue with selected tracks in list order
-	if m.stage == len(m.layout) && len(m.selected) > 0 {
-		var paths []string
-		for _, item := range m.items {
-			if m.selected[item.key] {
-				paths = append(paths, item.key)
-			}
-		}
+	if paths := m.selectedTrackPaths(); len(paths) > 0 {
 		snap := paths
 		return func() tea.Msg {
 			if len(snap) == 0 {
@@ -831,9 +995,35 @@ func (m *metaModel) playCurrent() tea.Cmd {
 	}
 	item := m.items[m.cursor]
 
-	if m.stage == len(m.layout) {
+	if m.atTrackLeaf() {
 		// Single track at leaf — replace
 		return playCmd(item.key, false)
+	}
+
+	if m.atReleaseStage() {
+		rel := item.key
+		var paths []string
+		for _, t := range m.tracks {
+			if !m.trackMatchesSelections(t) {
+				continue
+			}
+			if releaseFolderForTrack(t) != rel {
+				continue
+			}
+			paths = append(paths, t.path)
+		}
+		sort.Strings(paths)
+		snap := paths
+		return func() tea.Msg {
+			if len(snap) == 0 {
+				return statusMsg{text: "No tracks found", isErr: true}
+			}
+			mpvLoadFile(pipeName, snap[0], "replace")
+			for _, p := range snap[1:] {
+				mpvLoadFile(pipeName, p, "append-play")
+			}
+			return statusMsg{text: fmt.Sprintf("Playing %d tracks", len(snap))}
+		}
 	}
 
 	// Intermediate: collect all matching tracks, replace queue
@@ -873,10 +1063,41 @@ func (m *metaModel) appendCurrent() tea.Cmd {
 	if len(m.items) == 0 {
 		return nil
 	}
+	if paths := m.selectedTrackPaths(); len(paths) > 0 {
+		snap := paths
+		return func() tea.Msg {
+			for _, p := range snap {
+				mpvLoadFile(pipeName, p, "append-play")
+			}
+			return statusMsg{text: fmt.Sprintf("Queued %d tracks", len(snap))}
+		}
+	}
 	item := m.items[m.cursor]
 
-	if m.stage == len(m.layout) {
+	if m.atTrackLeaf() {
 		return playCmd(item.key, true)
+	}
+
+	if m.atReleaseStage() {
+		rel := item.key
+		var paths []string
+		for _, t := range m.tracks {
+			if !m.trackMatchesSelections(t) {
+				continue
+			}
+			if releaseFolderForTrack(t) != rel {
+				continue
+			}
+			paths = append(paths, t.path)
+		}
+		sort.Strings(paths)
+		snap := paths
+		return func() tea.Msg {
+			for _, p := range snap {
+				mpvLoadFile(pipeName, p, "append-play")
+			}
+			return statusMsg{text: fmt.Sprintf("Queued %d tracks", len(snap))}
+		}
 	}
 
 	// Build the full selection filter: current selections + this item's key
@@ -908,6 +1129,30 @@ func (m *metaModel) appendCurrent() tea.Cmd {
 	}
 }
 
+func (m *metaModel) exportSelectedCmd() tea.Cmd {
+	paths := m.selectedTrackPaths()
+
+	if len(paths) == 0 {
+		return func() tea.Msg {
+			return statusMsg{text: "No items selected", isErr: true}
+		}
+	}
+
+	return exportPathListCmd(paths, "meta-selection")
+}
+
+func (m *metaModel) exportSelectedAndOpenCmd() tea.Cmd {
+	paths := m.selectedTrackPaths()
+
+	if len(paths) == 0 {
+		return func() tea.Msg {
+			return statusMsg{text: "No items selected", isErr: true}
+		}
+	}
+
+	return exportPathListAndOpenCmd(paths, "meta-selection")
+}
+
 func (m *metaModel) switchLayout(delta int) {
 	n := len(layouts)
 	m.layoutIdx = (m.layoutIdx + n + delta) % n
@@ -915,6 +1160,7 @@ func (m *metaModel) switchLayout(delta int) {
 	// Reset to stage 0
 	m.stage = 0
 	m.selections = nil
+	m.releaseDir = ""
 	m.stageCursors = make(map[int]int)
 	m.stageFilters = make(map[int]string)
 	m.selected = make(map[string]bool)
@@ -938,7 +1184,12 @@ func (m *metaModel) breadcrumb() string {
 	for i, sel := range m.selections {
 		parts = append(parts, m.layout[i]+": "+truncateStr(sel, 30))
 	}
-	if m.stage < len(m.layout) {
+	if m.atReleaseStage() {
+		parts = append(parts, "Release")
+	} else if m.releaseDir != "" {
+		parts = append(parts, "Release: "+truncateStr(shortReleaseLabel(m.releaseDir, m.musicRoot), 30))
+		parts = append(parts, "Tracks")
+	} else if m.stage < len(m.layout) {
 		parts = append(parts, m.layout[m.stage])
 	} else {
 		parts = append(parts, "Tracks")
@@ -1129,12 +1380,16 @@ func (m metaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor++
 			}
 		case "enter", "right", "l":
+			if len(m.selected) > 0 {
+				cmd := m.playCurrent()
+				return m, tea.Batch(cmd, m.artRefreshCmd())
+			}
 			cmd := m.drillIn()
 			return m, tea.Batch(cmd, m.artRefreshCmd())
 		case "left", "h", "backspace":
 			m.goBack()
 		case " ":
-			if m.stage == len(m.layout) && len(m.items) > 0 {
+			if len(m.items) > 0 {
 				key := m.items[m.cursor].key
 				if m.selected[key] {
 					delete(m.selected, key)
@@ -1145,18 +1400,16 @@ func (m metaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cursor++
 				}
 				if len(m.selected) > 0 {
-					m.status = fmt.Sprintf("%d selected  a=queue  r=replace  Esc=clear", len(m.selected))
+					m.status = fmt.Sprintf("%d selected  a=queue  r=replace  e/E=export  Esc=clear", len(m.selected))
 				} else {
 					m.status = ""
 				}
 			}
 		case "ctrl+a":
-			if m.stage == len(m.layout) {
-				for _, item := range m.items {
-					m.selected[item.key] = true
-				}
-				m.status = fmt.Sprintf("%d selected  a=queue  r=replace  Esc=clear", len(m.selected))
+			for _, item := range m.items {
+				m.selected[item.key] = true
 			}
+			m.status = fmt.Sprintf("%d selected  a=queue  r=replace  e/E=export  Esc=clear", len(m.selected))
 		case "/":
 			m.filterMode = true
 			m.filterCursor = len([]rune(m.filter))
@@ -1166,6 +1419,10 @@ func (m metaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			cmd := m.playCurrent()
 			return m, cmd
+		case "e":
+			return m, m.exportSelectedCmd()
+		case "E":
+			return m, m.exportSelectedAndOpenCmd()
 		case "?":
 			m.helpMode = true
 			return m, nil
@@ -1212,6 +1469,7 @@ func (m metaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.splitGenres = !m.splitGenres
 			m.stage = 0
 			m.selections = nil
+			m.releaseDir = ""
 			m.stageCursors = make(map[int]int)
 			m.stageFilters = make(map[int]string)
 			m.selected = make(map[string]bool)
@@ -1261,6 +1519,8 @@ func (m metaModel) View() string {
 			"  Selection  (track level only)",
 			"    Space           toggle mark",
 			"    ctrl+a          mark all visible",
+			"    e               export selected paths to txt + m3u8",
+			"    E               export selected + open exports folder",
 			"    Esc             clear marks",
 			"",
 			"  Filter",
@@ -1335,17 +1595,15 @@ func (m metaModel) View() string {
 		end = len(m.items)
 	}
 
-	isLeaf := m.stage == len(m.layout)
+	isLeaf := m.atTrackLeaf()
 
 	for i := start; i < end; i++ {
 		item := m.items[i]
 		var label string
-		if isLeaf {
-			if m.selected[item.key] {
-				label = "✓ " + item.display
-			} else {
-				label = "♪ " + item.display
-			}
+		if m.selected[item.key] {
+			label = "✓ " + item.display
+		} else if isLeaf {
+			label = "♪ " + item.display
 		} else {
 			label = "▶ " + item.display
 		}
@@ -1357,7 +1615,7 @@ func (m metaModel) View() string {
 				padLen = 0
 			}
 			line = "  " + styleSel.Render(" "+label+strings.Repeat(" ", padLen))
-		} else if isLeaf && m.selected[item.key] {
+		} else if m.selected[item.key] {
 			line = "  " + styleMarked.Render(label)
 		} else if isLeaf {
 			line = "  " + styleFile.Render(label)
@@ -1398,9 +1656,9 @@ func (m metaModel) View() string {
 	if m.filterMode {
 		help = "  type to filter  ↑↓ navigate  ←→ move cursor  Home/End jump  Enter select  Backspace delete  Del delete  Esc exit filter"
 	} else if isLeaf {
-		help = "  Enter play  a append  r replace  n/N next/prev  ↑↓/jk  ← back  / filter  L/H layouts  s split-genre  " + artHint + "  v view  Tab→folders  p pause  q quit"
+		help = "  Enter play  a append  r replace  e export  E export+open  n/N next/prev  ↑↓/jk  ← back  / filter  L/H layouts  s split-genre  " + artHint + "  v view  Tab→folders  p pause  q quit"
 	} else {
-		help = "  Enter drill down  a queue all  r replace  n/N next/prev  ↑↓/jk  ← back  / filter  L/H layouts  s split-genre  " + artHint + "  Tab→folders  q quit"
+		help = "  Space select  Enter drill down  a queue selected/current  r replace selected/current  e export selected  E export+open  n/N next/prev  ↑↓/jk  ← back  / filter  L/H layouts  s split-genre  " + artHint + "  Tab→folders  q quit"
 	}
 	sb.WriteString(styleHelp.Render(help))
 
